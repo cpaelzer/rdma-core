@@ -1,3 +1,13 @@
+rdma-core (21.0-2) UNRELEASED; urgency=medium
+
+  * do not unconditionally start ibacm sysV init script or ibacm.service on
+    install/upgrade as it is meant to be socket activated and doesn't work
+    in all environments needing the ub_umad module to be loaded (LP: #1794825)
+    - d/rules: let dh_installinit not start sysV init on install
+    - d/rules: let dh_installsystemd not start ibacm.service on install
+
+ -- Christian Ehrhardt <christian.ehrhardt@canonical.com>  Tue, 16 Oct 2018 14:46:54 +0200
+
 rdma-core (21.0-1) unstable; urgency=medium
 
   * New upstream release.
