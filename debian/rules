@@ -114,10 +114,4 @@ override_dh_strip:
 # directory, allow that directory to be present and still allow dh to work.
 .PHONY: build
 build:
-<<<<<<< HEAD
-	dh $@ --builddirectory=build-deb
-||||||| merged common ancestors
-	dh $@ --with systemd --builddirectory=build-deb
-=======
 	dh $@ $(dh_params)
->>>>>>> v23
