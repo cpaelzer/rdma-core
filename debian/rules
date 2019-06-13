@@ -71,20 +71,20 @@ INST_EXCLUDE := "etc/init.d/srpd" \
 		"usr/sbin/run_srp_daemon" \
 		"usr/sbin/srp_daemon.sh"
 INST_EXCLUDE := $(addprefix -X,$(INST_EXCLUDE))
-<<<<<<< HEAD
+
 override_dh_missing:
-	dh_missing --fail-missing $(INST_EXCLUDE)
-||||||| merged common ancestors
-override_dh_install:
-	dh_install --fail-missing $(INST_EXCLUDE)
-=======
+	if [ -e build-deb/python/pyverbs/__init__.py ]; then \
+		dh_missing --fail-missing $(INST_EXCLUDE); \
+	else \
+		dh_missing -Npython3-pyverbs --fail-missing $(INST_EXCLUDE) --remaining-packages; \
+	fi
+
 override_dh_install:
 	if [ -e build-deb/python/pyverbs/__init__.py ]; then \
-		dh_install --fail-missing $(INST_EXCLUDE); \
+		dh_install $(INST_EXCLUDE); \
 	else \
-		dh_install -Npython3-pyverbs --fail-missing $(INST_EXCLUDE) --remaining-packages; \
+		dh_install -Npython3-pyverbs $(INST_EXCLUDE) --remaining-packages; \
 	fi
->>>>>>> v23
 
 # cmake installs the correct init scripts in the correct place, just setup the
 # pre-postrms
