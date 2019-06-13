@@ -55,6 +55,7 @@
 #include "mlx5.h"
 #include "mlx5-abi.h"
 #include "wqe.h"
+#include "mlx5_ifc.h"
 
 int mlx5_single_threaded = 0;
 
@@ -552,11 +553,6 @@ int mlx5_round_up_power_of_two(long long sz)
 	return (int)ret;
 }
 
-static int align_queue_size(long long req)
-{
-	return mlx5_round_up_power_of_two(req);
-}
-
 static int get_cqe_size(struct mlx5dv_cq_init_attr *mlx5cq_attr)
 {
 	char *env;
@@ -1015,11 +1011,10 @@ struct ibv_srq *mlx5_create_srq(struct ibv_pd *pd,
 		goto err;
 	}
 
-	srq->max     = align_queue_size(attr->attr.max_wr + 1);
 	srq->max_gs  = attr->attr.max_sge;
 	srq->counter = 0;
 
-	if (mlx5_alloc_srq_buf(pd->context, srq)) {
+	if (mlx5_alloc_srq_buf(pd->context, srq, attr->attr.max_wr)) {
 		fprintf(stderr, "%s-%d:\n", __func__, __LINE__);
 		goto err;
 	}
@@ -1040,10 +1035,21 @@ struct ibv_srq *mlx5_create_srq(struct ibv_pd *pd,
 
 	attr->attr.max_sge = srq->max_gs;
 	pthread_mutex_lock(&ctx->srq_table_mutex);
+
+	/* Override max_wr to let kernel know about extra WQEs for the
+	 * wait queue.
+	 */
+	attr->attr.max_wr = srq->max - 1;
+
 	ret = ibv_cmd_create_srq(pd, ibsrq, attr, &cmd.ibv_cmd, sizeof(cmd),
 				 &resp.ibv_resp, sizeof(resp));
 	if (ret)
 		goto err_db;
+
+	/* Override kernel response that includes the wait queue with the real
+	 * number of WQEs that are applicable for the application.
+	 */
+	attr->attr.max_wr = srq->tail;
 
 	ret = mlx5_store_srq(ctx, resp.srqn, srq);
 	if (ret)
@@ -1452,13 +1458,13 @@ static int mlx5_alloc_qp_buf(struct ibv_context *context,
 			err = -1;
 			goto ex_wrid;
 		}
-	}
 
-	qp->sq.wqe_head = malloc(qp->sq.wqe_cnt * sizeof(*qp->sq.wqe_head));
-	if (!qp->sq.wqe_head) {
-		errno = ENOMEM;
-		err = -1;
+		qp->sq.wqe_head = malloc(qp->sq.wqe_cnt * sizeof(*qp->sq.wqe_head));
+		if (!qp->sq.wqe_head) {
+			errno = ENOMEM;
+			err = -1;
 			goto ex_wrid;
+		}
 	}
 
 	if (qp->rq.wqe_cnt) {
@@ -2454,10 +2460,8 @@ struct ibv_ah *mlx5_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr)
 			ah->kern_ah = true;
 			memcpy(ah->av.rmac, resp.dmac, ETHERNET_LL_SIZE);
 		} else {
-			uint16_t vid;
-
 			if (ibv_resolve_eth_l2_from_gid(pd->context, attr,
-							ah->av.rmac, &vid))
+							ah->av.rmac, NULL))
 				goto err;
 		}
 	}
@@ -2708,11 +2712,10 @@ struct ibv_srq *mlx5_create_srq_ex(struct ibv_context *context,
 		goto err;
 	}
 
-	msrq->max     = align_queue_size(attr->attr.max_wr + 1);
 	msrq->max_gs  = attr->attr.max_sge;
 	msrq->counter = 0;
 
-	if (mlx5_alloc_srq_buf(context, msrq)) {
+	if (mlx5_alloc_srq_buf(context, msrq, attr->attr.max_wr)) {
 		fprintf(stderr, "%s-%d:\n", __func__, __LINE__);
 		goto err;
 	}
@@ -2744,9 +2747,20 @@ struct ibv_srq *mlx5_create_srq_ex(struct ibv_context *context,
 		pthread_mutex_lock(&ctx->srq_table_mutex);
 	}
 
+	/* Override max_wr to let kernel know about extra WQEs for the
+	 * wait queue.
+	 */
+	attr->attr.max_wr = msrq->max - 1;
+
 	err = ibv_cmd_create_srq_ex(context, &msrq->vsrq, sizeof(msrq->vsrq),
 				    attr, &cmd.ibv_cmd, sizeof(cmd),
 				    &resp.ibv_resp, sizeof(resp));
+
+	/* Override kernel response that includes the wait queue with the real
+	 * number of WQEs that are applicable for the application.
+	 */
+	attr->attr.max_wr = msrq->tail;
+
 	if (err)
 		goto err_free_uidx;
 
@@ -2814,6 +2828,32 @@ err:
 	free(msrq);
 
 	return NULL;
+}
+
+static void get_pci_atomic_caps(struct ibv_context *context,
+				struct ibv_device_attr_ex *attr)
+{
+	uint32_t in[DEVX_ST_SZ_DW(query_hca_cap_in)] = {};
+	uint32_t out[DEVX_ST_SZ_DW(query_hca_cap_out)] = {};
+	uint16_t opmod = (MLX5_CAP_ATOMIC << 1) | HCA_CAP_OPMOD_GET_CUR;
+	int ret;
+
+	DEVX_SET(query_hca_cap_in, in, opcode, MLX5_CMD_OP_QUERY_HCA_CAP);
+	DEVX_SET(query_hca_cap_in, in, op_mod, opmod);
+
+	ret = mlx5dv_devx_general_cmd(context, in, sizeof(in), out,
+				      sizeof(out));
+	if (!ret) {
+		attr->pci_atomic_caps.fetch_add =
+			DEVX_GET(query_hca_cap_out, out,
+				 capability.atomic_caps.fetch_add_pci_atomic);
+		attr->pci_atomic_caps.swap =
+			DEVX_GET(query_hca_cap_out, out,
+				 capability.atomic_caps.swap_pci_atomic);
+		attr->pci_atomic_caps.compare_swap =
+			DEVX_GET(query_hca_cap_out, out,
+			capability.atomic_caps.compare_swap_pci_atomic);
+	}
 }
 
 int mlx5_query_device_ex(struct ibv_context *context,
@@ -2893,6 +2933,10 @@ int mlx5_query_device_ex(struct ibv_context *context,
 	a = &attr->orig_attr;
 	snprintf(a->fw_ver, sizeof(a->fw_ver), "%d.%d.%04d",
 		 major, minor, sub_minor);
+
+	if (attr_size >= offsetof(struct ibv_device_attr_ex, pci_atomic_caps) +
+			sizeof(attr->pci_atomic_caps))
+		get_pci_atomic_caps(context, attr);
 
 	return 0;
 }
@@ -3494,13 +3538,14 @@ int mlx5_destroy_flow_action(struct ibv_flow_action *action)
 	return ret;
 }
 
-static inline int mlx5_memcpy_to_dm(struct ibv_dm *ibdm, uint64_t dm_offset,
-				    const void *host_addr, size_t length)
+static inline int mlx5_access_dm(struct ibv_dm *ibdm, uint64_t dm_offset,
+				 void *host_addr, size_t length,
+				 uint32_t read)
 {
 	struct mlx5_dm *dm = to_mdm(ibdm);
 	atomic_uint32_t *dm_ptr =
 		(atomic_uint32_t *)dm->start_va + dm_offset / 4;
-	const uint32_t *host_ptr = host_addr;
+	uint32_t *host_ptr = host_addr;
 	const uint32_t *host_end = host_ptr + length / 4;
 
 	if (dm_offset + length > dm->length)
@@ -3515,31 +3560,34 @@ static inline int mlx5_memcpy_to_dm(struct ibv_dm *ibdm, uint64_t dm_offset,
 	/* Copy granularity should be 4 Bytes since we enforce copy size to be
 	 * a multiple of 4 bytes.
 	 */
-	while (host_ptr != host_end) {
-		atomic_store_explicit(dm_ptr, *host_ptr, memory_order_relaxed);
-		host_ptr++;
-		dm_ptr++;
+	if (read) {
+		while (host_ptr != host_end) {
+			*host_ptr = atomic_load_explicit(dm_ptr,
+							 memory_order_relaxed);
+			host_ptr++;
+			dm_ptr++;
+		}
+	} else {
+		while (host_ptr != host_end) {
+			atomic_store_explicit(dm_ptr, *host_ptr,
+					      memory_order_relaxed);
+			host_ptr++;
+			dm_ptr++;
+		}
 	}
 
 	return 0;
+}
+static inline int mlx5_memcpy_to_dm(struct ibv_dm *ibdm, uint64_t dm_offset,
+				    const void *host_addr, size_t length)
+{
+	return mlx5_access_dm(ibdm, dm_offset, (void *)host_addr, length, 0);
 }
 
 static inline int mlx5_memcpy_from_dm(void *host_addr, struct ibv_dm *ibdm,
 				      uint64_t dm_offset, size_t length)
 {
-	struct mlx5_dm *dm = to_mdm(ibdm);
-	void *dm_va = dm->start_va + dm_offset;
-
-	if (dm_offset + length > dm->length)
-		return EFAULT;
-
-	/* DM access address must be aligned to 4 bytes */
-	if (dm_offset & 3)
-		return EINVAL;
-
-	memcpy(host_addr, dm_va, length);
-
-	return 0;
+	return mlx5_access_dm(ibdm, dm_offset, host_addr, length, 1);
 }
 
 struct ibv_dm *mlx5_alloc_dm(struct ibv_context *context,
@@ -4287,3 +4335,79 @@ int mlx5dv_devx_ind_tbl_modify(struct ibv_rwq_ind_table *ind_tbl, const void *in
 
 	return execute_ioctl(ind_tbl->context, cmd);
 }
+
+struct mlx5dv_devx_cmd_comp *
+mlx5dv_devx_create_cmd_comp(struct ibv_context *context)
+{
+	DECLARE_COMMAND_BUFFER(cmd,
+			       MLX5_IB_OBJECT_DEVX_ASYNC_CMD_FD,
+			       MLX5_IB_METHOD_DEVX_ASYNC_CMD_FD_ALLOC,
+			       1);
+	struct ib_uverbs_attr *handle;
+	struct mlx5dv_devx_cmd_comp *cmd_comp;
+	int ret;
+
+	cmd_comp = calloc(1, sizeof(*cmd_comp));
+	if (!cmd_comp) {
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	handle = fill_attr_out_fd(cmd,
+				  MLX5_IB_ATTR_DEVX_ASYNC_CMD_FD_ALLOC_HANDLE,
+				  0);
+
+	ret = execute_ioctl(context, cmd);
+	if (ret)
+		goto err;
+
+	cmd_comp->fd = read_attr_fd(
+		MLX5_IB_ATTR_DEVX_ASYNC_CMD_FD_ALLOC_HANDLE, handle);
+	return cmd_comp;
+err:
+	free(cmd_comp);
+	return NULL;
+}
+
+void mlx5dv_devx_destroy_cmd_comp(
+			struct mlx5dv_devx_cmd_comp *cmd_comp)
+{
+	close(cmd_comp->fd);
+	free(cmd_comp);
+}
+
+int mlx5dv_devx_obj_query_async(struct mlx5dv_devx_obj *obj, const void *in,
+				size_t inlen, size_t outlen,
+				uint64_t wr_id,
+				struct mlx5dv_devx_cmd_comp *cmd_comp)
+{
+	DECLARE_COMMAND_BUFFER(cmd,
+			       MLX5_IB_OBJECT_DEVX_OBJ,
+			       MLX5_IB_METHOD_DEVX_OBJ_ASYNC_QUERY,
+			       5);
+
+	fill_attr_in_obj(cmd, MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_HANDLE, obj->handle);
+	fill_attr_in(cmd, MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_CMD_IN, in, inlen);
+	fill_attr_const_in(cmd, MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_OUT_LEN, outlen);
+	fill_attr_in_uint64(cmd, MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_WR_ID, wr_id);
+	fill_attr_in_fd(cmd, MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_FD, cmd_comp->fd);
+
+	return execute_ioctl(obj->context, cmd);
+}
+
+int mlx5dv_devx_get_async_cmd_comp(struct mlx5dv_devx_cmd_comp *cmd_comp,
+				   struct mlx5dv_devx_async_cmd_hdr *cmd_resp,
+				   size_t cmd_resp_len)
+{
+	ssize_t bytes;
+
+	bytes = read(cmd_comp->fd, cmd_resp, cmd_resp_len);
+	if (bytes < 0)
+		return errno;
+
+	if (bytes < sizeof(*cmd_resp))
+		return EINVAL;
+
+	return 0;
+}
+

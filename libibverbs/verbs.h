@@ -204,6 +204,7 @@ enum ibv_odp_transport_cap_bits {
 	IBV_ODP_SUPPORT_WRITE    = 1 << 2,
 	IBV_ODP_SUPPORT_READ     = 1 << 3,
 	IBV_ODP_SUPPORT_ATOMIC   = 1 << 4,
+	IBV_ODP_SUPPORT_SRQ_RECV = 1 << 5,
 };
 
 struct ibv_odp_caps {
@@ -217,6 +218,7 @@ struct ibv_odp_caps {
 
 enum ibv_odp_general_caps {
 	IBV_ODP_SUPPORT = 1 << 0,
+	IBV_ODP_SUPPORT_IMPLICIT = 1 << 1,
 };
 
 struct ibv_tso_caps {
@@ -293,6 +295,22 @@ struct ibv_cq_moderation_caps {
 	uint16_t max_cq_period; /* in micro seconds */
 };
 
+enum ibv_pci_atomic_op_size {
+	IBV_PCI_ATOMIC_OPERATION_4_BYTE_SIZE_SUP = 1 << 0,
+	IBV_PCI_ATOMIC_OPERATION_8_BYTE_SIZE_SUP = 1 << 1,
+	IBV_PCI_ATOMIC_OPERATION_16_BYTE_SIZE_SUP = 1 << 2,
+};
+
+/*
+ * Bitmask for supported operation sizes
+ * Use enum ibv_pci_atomic_op_size
+ */
+struct ibv_pci_atomic_caps {
+	uint16_t fetch_add;
+	uint16_t swap;
+	uint16_t compare_swap;
+};
+
 struct ibv_device_attr_ex {
 	struct ibv_device_attr	orig_attr;
 	uint32_t		comp_mask;
@@ -308,6 +326,8 @@ struct ibv_device_attr_ex {
 	struct ibv_tm_caps	tm_caps;
 	struct ibv_cq_moderation_caps  cq_mod_caps;
 	uint64_t max_dm_size;
+	struct ibv_pci_atomic_caps pci_atomic_caps;
+	uint32_t xrc_odp_caps;
 };
 
 enum ibv_mtu {

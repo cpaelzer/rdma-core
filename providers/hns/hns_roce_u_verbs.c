@@ -89,9 +89,9 @@ struct ibv_pd *hns_roce_u_alloc_pd(struct ibv_context *context)
 {
 	struct ibv_alloc_pd cmd;
 	struct hns_roce_pd *pd;
-	struct hns_roce_alloc_pd_resp resp;
+	struct hns_roce_alloc_pd_resp resp = {};
 
-	pd = (struct hns_roce_pd *)malloc(sizeof(*pd));
+	pd = malloc(sizeof(*pd));
 	if (!pd)
 		return NULL;
 
@@ -277,6 +277,16 @@ static int align_queue_size(int req)
 	return nent;
 }
 
+static int align_srq_size(int req)
+{
+	int nent;
+
+	for (nent = 1; nent < req; nent <<= 1)
+		;
+
+	return nent;
+}
+
 static void hns_roce_set_sq_sizes(struct hns_roce_qp *qp,
 				  struct ibv_qp_cap *cap, enum ibv_qp_type type)
 {
@@ -291,19 +301,11 @@ static void hns_roce_set_sq_sizes(struct hns_roce_qp *qp,
 
 static int hns_roce_verify_cq(int *cqe, struct hns_roce_context *context)
 {
-	struct hns_roce_device *hr_dev =
-		to_hr_dev(context->ibv_ctx.context.device);
-
-	if (hr_dev->hw_version == HNS_ROCE_HW_VER1)
-		if (*cqe < HNS_ROCE_MIN_CQE_NUM) {
-			fprintf(stderr,
-				"cqe = %d, less than minimum CQE number.\n",
-				*cqe);
-			*cqe = HNS_ROCE_MIN_CQE_NUM;
-		}
-
-	if (*cqe > context->max_cqe)
+	if (*cqe < 1 || *cqe > context->max_cqe)
 		return -1;
+
+	if (*cqe < HNS_ROCE_MIN_CQE_NUM)
+		*cqe = HNS_ROCE_MIN_CQE_NUM;
 
 	return 0;
 }
@@ -434,6 +436,177 @@ int hns_roce_u_destroy_cq(struct ibv_cq *cq)
 	return ret;
 }
 
+static int hns_roce_create_idx_que(struct ibv_pd *pd, struct hns_roce_srq *srq)
+{
+	struct hns_roce_idx_que	*idx_que = &srq->idx_que;
+	uint32_t bitmap_num;
+	int i;
+
+	idx_que->entry_sz = HNS_ROCE_IDX_QUE_ENTRY_SZ;
+
+	/* bits needed in bitmap*/
+	bitmap_num = align(srq->max, BIT_CNT_PER_BYTE * sizeof(uint64_t));
+
+	idx_que->bitmap = calloc(1, bitmap_num / BIT_CNT_PER_BYTE);
+	if (!idx_que->bitmap)
+		return -1;
+
+	/* bitmap_num indicates amount of u64 */
+	bitmap_num = bitmap_num / (BIT_CNT_PER_BYTE * sizeof(uint64_t));
+
+	idx_que->buf_size = srq->max * idx_que->entry_sz;
+	if (hns_roce_alloc_buf(&idx_que->buf, align(idx_que->buf_size, 0x1000),
+			       to_hr_dev(pd->context->device)->page_size)) {
+		free(idx_que->bitmap);
+		idx_que->bitmap = NULL;
+		return -1;
+	}
+
+	memset(idx_que->buf.buf, 0, idx_que->buf_size);
+
+	/*init the idx_que bitmap */
+	for (i = 0; i < bitmap_num; ++i)
+		idx_que->bitmap[i] = ~(0UL);
+
+	return 0;
+}
+
+static int hns_roce_alloc_srq_buf(struct ibv_pd *pd, struct ibv_srq_attr *attr,
+				  struct hns_roce_srq *srq)
+{
+	int srq_buf_size;
+	int srq_size;
+
+	srq->wrid = calloc(1, srq->max * sizeof(unsigned long));
+	if (!srq->wrid)
+		return -1;
+
+	/* srq size */
+	srq_size = srq->max_gs * sizeof(struct hns_roce_v2_wqe_data_seg);
+
+	for (srq->wqe_shift = 4; 1 << srq->wqe_shift < srq_size;
+	     ++srq->wqe_shift)
+		; /* nothing */
+
+	srq_buf_size = srq->max << srq->wqe_shift;
+
+	/* allocate srq wqe buf */
+	if (hns_roce_alloc_buf(&srq->buf, srq_buf_size,
+			       to_hr_dev(pd->context->device)->page_size)) {
+		free(srq->wrid);
+		return -1;
+	}
+
+	memset(srq->buf.buf, 0, srq_buf_size);
+
+	srq->head = 0;
+	srq->tail = srq->max - 1;
+
+	return 0;
+}
+
+struct ibv_srq *hns_roce_u_create_srq(struct ibv_pd *pd,
+				      struct ibv_srq_init_attr *srq_init_attr)
+{
+	struct hns_roce_create_srq	cmd;
+	struct hns_roce_create_srq_resp resp;
+	struct hns_roce_srq		*srq;
+	int ret;
+
+	if (srq_init_attr->attr.max_wr > (1 << 15) ||
+	    srq_init_attr->attr.max_sge > (1 << 8))
+		return NULL;
+
+	srq = calloc(1, sizeof(*srq));
+	if (!srq)
+		return NULL;
+
+	if (pthread_spin_init(&srq->lock, PTHREAD_PROCESS_PRIVATE))
+		goto out;
+
+	srq->max = align_srq_size(srq_init_attr->attr.max_wr + 1);
+	srq->max_gs = srq_init_attr->attr.max_sge;
+
+	ret = hns_roce_create_idx_que(pd, srq);
+	if (ret) {
+		fprintf(stderr, "hns_roce_create_idx_que failed!\n");
+		goto out;
+	}
+
+	if (hns_roce_alloc_srq_buf(pd, &srq_init_attr->attr, srq)) {
+		fprintf(stderr, "hns_roce_alloc_srq_buf failed!\n");
+		goto err_idx_que;
+	}
+
+	srq->db = hns_roce_alloc_db(to_hr_ctx(pd->context),
+				    HNS_ROCE_QP_TYPE_DB);
+	if (!srq->db)
+		goto err_srq_buf;
+
+	*(srq->db) = 0;
+	cmd.buf_addr = (uintptr_t)srq->buf.buf;
+	cmd.que_addr = (uintptr_t)srq->idx_que.buf.buf;
+	cmd.db_addr = (uintptr_t)srq->db;
+
+	ret = ibv_cmd_create_srq(pd, &srq->verbs_srq.srq, srq_init_attr,
+				&cmd.ibv_cmd, sizeof(cmd), &resp.ibv_resp,
+				sizeof(resp));
+	if (ret)
+		goto err_srq_db;
+
+	srq->srqn = resp.srqn;
+	return &srq->verbs_srq.srq;
+
+err_srq_db:
+	hns_roce_free_db(to_hr_ctx(pd->context), srq->db, HNS_ROCE_QP_TYPE_DB);
+
+err_srq_buf:
+	free(srq->wrid);
+	hns_roce_free_buf(&srq->buf);
+
+err_idx_que:
+	free(srq->idx_que.bitmap);
+	hns_roce_free_buf(&srq->idx_que.buf);
+out:
+	free(srq);
+	return NULL;
+}
+
+int hns_roce_u_modify_srq(struct ibv_srq *srq, struct ibv_srq_attr *srq_attr,
+			  int srq_attr_mask)
+{
+	struct ibv_modify_srq cmd;
+
+	return ibv_cmd_modify_srq(srq, srq_attr, srq_attr_mask, &cmd,
+				  sizeof(cmd));
+}
+
+int hns_roce_u_query_srq(struct ibv_srq *srq, struct ibv_srq_attr *srq_attr)
+{
+	struct ibv_query_srq cmd;
+
+	return ibv_cmd_query_srq(srq, srq_attr, &cmd, sizeof(cmd));
+}
+
+int hns_roce_u_destroy_srq(struct ibv_srq *srq)
+{
+	int ret;
+
+	ret = ibv_cmd_destroy_srq(srq);
+	if (ret)
+		return ret;
+
+	hns_roce_free_db(to_hr_ctx(srq->context), to_hr_srq(srq)->db,
+			 HNS_ROCE_QP_TYPE_DB);
+	hns_roce_free_buf(&to_hr_srq(srq)->buf);
+	free(to_hr_srq(srq)->wrid);
+	hns_roce_free_buf(&to_hr_srq(srq)->idx_que.buf);
+	free(to_hr_srq(srq)->idx_que.bitmap);
+	free(to_hr_srq(srq));
+
+	return 0;
+}
+
 static int hns_roce_verify_qp(struct ibv_qp_init_attr *attr,
 			      struct hns_roce_context *context)
 {
@@ -477,24 +650,40 @@ static int hns_roce_verify_qp(struct ibv_qp_init_attr *attr,
 	return 0;
 }
 
-static int hns_roce_alloc_qp_buf(struct ibv_pd *pd, struct ibv_qp_cap *cap,
-				 enum ibv_qp_type type, struct hns_roce_qp *qp)
+static int hns_roce_alloc_recv_inl_buf(struct ibv_qp_cap *cap,
+				       struct hns_roce_qp *qp)
 {
 	int i;
-	int page_size = to_hr_dev(pd->context->device)->page_size;
 
-	qp->sq.wrid =
-		(unsigned long *)malloc(qp->sq.wqe_cnt * sizeof(uint64_t));
-	if (!qp->sq.wrid)
+	qp->rq_rinl_buf.wqe_list = calloc(1, qp->rq.wqe_cnt *
+					  sizeof(struct hns_roce_rinl_wqe));
+	if (!qp->rq_rinl_buf.wqe_list)
 		return -1;
 
-	if (qp->rq.wqe_cnt) {
-		qp->rq.wrid = malloc(qp->rq.wqe_cnt * sizeof(uint64_t));
-		if (!qp->rq.wrid) {
-			free(qp->sq.wrid);
-			return -1;
-		}
+	qp->rq_rinl_buf.wqe_cnt = qp->rq.wqe_cnt;
+
+	qp->rq_rinl_buf.wqe_list[0].sg_list = calloc(1, qp->rq.wqe_cnt *
+			  cap->max_recv_sge * sizeof(struct hns_roce_rinl_sge));
+	if (!qp->rq_rinl_buf.wqe_list[0].sg_list) {
+		free(qp->rq_rinl_buf.wqe_list);
+		return -1;
 	}
+
+	for (i = 0; i < qp->rq_rinl_buf.wqe_cnt; i++) {
+		int wqe_size = i * cap->max_recv_sge;
+
+		qp->rq_rinl_buf.wqe_list[i].sg_list =
+			  &(qp->rq_rinl_buf.wqe_list[0].sg_list[wqe_size]);
+	}
+
+	return 0;
+}
+
+static int hns_roce_calc_qp_buff_size(struct ibv_pd *pd, struct ibv_qp_cap *cap,
+				      enum ibv_qp_type type,
+				      struct hns_roce_qp *qp)
+{
+	int page_size = to_hr_dev(pd->context->device)->page_size;
 
 	if (to_hr_dev(pd->context->device)->hw_version == HNS_ROCE_HW_VER1) {
 		for (qp->rq.wqe_shift = 4; 1 << qp->rq.wqe_shift <
@@ -523,35 +712,9 @@ static int hns_roce_alloc_qp_buf(struct ibv_pd *pd, struct ibv_qp_cap *cap,
 		else
 			qp->sge.sge_shift = 0;
 
-		/* alloc recv inline buf*/
-		qp->rq_rinl_buf.wqe_list =
-			(struct hns_roce_rinl_wqe *)calloc(1, qp->rq.wqe_cnt *
-					      sizeof(struct hns_roce_rinl_wqe));
-		if (!qp->rq_rinl_buf.wqe_list) {
-			if (qp->rq.wqe_cnt)
-				free(qp->rq.wrid);
-			free(qp->sq.wrid);
+		/* alloc recv inline buf */
+		if (hns_roce_alloc_recv_inl_buf(cap, qp))
 			return -1;
-		}
-
-		qp->rq_rinl_buf.wqe_cnt = qp->rq.wqe_cnt;
-
-		qp->rq_rinl_buf.wqe_list[0].sg_list =
-			(struct hns_roce_rinl_sge *)calloc(1, qp->rq.wqe_cnt *
-			  cap->max_recv_sge * sizeof(struct hns_roce_rinl_sge));
-		if (!qp->rq_rinl_buf.wqe_list[0].sg_list) {
-			if (qp->rq.wqe_cnt)
-				free(qp->rq.wrid);
-			free(qp->sq.wrid);
-			free(qp->rq_rinl_buf.wqe_list);
-			return -1;
-		}
-		for (i = 0; i < qp->rq_rinl_buf.wqe_cnt; i++) {
-			int wqe_size = i * cap->max_recv_sge;
-
-			qp->rq_rinl_buf.wqe_list[i].sg_list =
-			  &(qp->rq_rinl_buf.wqe_list[0].sg_list[wqe_size]);
-		}
 
 		qp->buf_size = align((qp->sq.wqe_cnt << qp->sq.wqe_shift),
 				     page_size) +
@@ -572,6 +735,33 @@ static int hns_roce_alloc_qp_buf(struct ibv_pd *pd, struct ibv_qp_cap *cap,
 			qp->rq.offset = align((qp->sq.wqe_cnt <<
 						qp->sq.wqe_shift), page_size);
 		}
+	}
+
+	return 0;
+}
+
+static int hns_roce_alloc_qp_buf(struct ibv_pd *pd, struct ibv_qp_cap *cap,
+				 enum ibv_qp_type type, struct hns_roce_qp *qp)
+{
+	int page_size = to_hr_dev(pd->context->device)->page_size;
+
+	qp->sq.wrid = malloc(qp->sq.wqe_cnt * sizeof(uint64_t));
+	if (!qp->sq.wrid)
+		return -1;
+
+	if (qp->rq.wqe_cnt) {
+		qp->rq.wrid = malloc(qp->rq.wqe_cnt * sizeof(uint64_t));
+		if (!qp->rq.wrid) {
+			free(qp->sq.wrid);
+			return -1;
+		}
+	}
+
+	if (hns_roce_calc_qp_buff_size(pd, cap, type, qp)) {
+		if (qp->rq.wqe_cnt)
+			free(qp->rq.wrid);
+		free(qp->sq.wrid);
+		return -1;
 	}
 
 	if (hns_roce_alloc_buf(&qp->buf, align(qp->buf_size, page_size),
@@ -664,7 +854,7 @@ struct ibv_qp *hns_roce_u_create_qp(struct ibv_pd *pd,
 	}
 
 	if ((to_hr_dev(pd->context->device)->hw_version != HNS_ROCE_HW_VER1) &&
-		attr->cap.max_send_sge) {
+		attr->cap.max_send_wr) {
 		qp->sdb = hns_roce_alloc_db(context, HNS_ROCE_QP_TYPE_DB);
 		if (!qp->sdb)
 			goto err_free;
@@ -735,7 +925,7 @@ err_rq_db:
 
 err_sq_db:
 	if ((to_hr_dev(pd->context->device)->hw_version != HNS_ROCE_HW_VER1) &&
-	    attr->cap.max_send_sge)
+	    attr->cap.max_send_wr)
 		hns_roce_free_db(context, qp->sdb, HNS_ROCE_QP_TYPE_DB);
 
 err_free:

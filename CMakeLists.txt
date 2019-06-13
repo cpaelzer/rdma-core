@@ -65,7 +65,7 @@ endif()
 set(PACKAGE_NAME "RDMA")
 
 # See Documentation/versioning.md
-set(PACKAGE_VERSION "22.0")
+set(PACKAGE_VERSION "23.0")
 # When this is changed the values in these files need changing too:
 #   debian/control
 #   debian/libibverbs1.symbols
@@ -360,23 +360,23 @@ else()
   set(HAVE_FULL_SYMBOL_VERSIONS 1)
 endif()
 
-if (${NO_PYVERBS})
-  set(CYTHON_EXECUTABLE "")
-else ()
-  # Look for Python. We prefer some variant of python 3 if the system has it.
-  FIND_PACKAGE(PythonInterp 3 QUIET)
-  if (NOT ${PythonInterp_FOUND})
-    FIND_PACKAGE(PythonInterp REQUIRED)
-  endif()
-  FIND_PACKAGE(cython)
-endif()
-
 # Look for Python. We prefer some variant of python 3 if the system has it.
 FIND_PACKAGE(PythonInterp 3 QUIET)
-if (NOT ${PythonInterp_FOUND})
+if (PythonInterp_FOUND)
+  # pyverbs can only use python3:
+  if (NO_PYVERBS)
+    set(CYTHON_EXECUTABLE "")
+  else()
+    FIND_PACKAGE(cython)
+  endif()
+else()
+  # But we still must have python (be it 2) for the build process:
   FIND_PACKAGE(PythonInterp REQUIRED)
+  set(CYTHON_EXECUTABLE "")
 endif()
+
 # A cython & python-devel installation that matches our selected interpreter.
+
 if (CYTHON_EXECUTABLE)
  # cmake has really bad logic here, if PythonIterp has been run it tries to
  # find a matching -devel installation but will happily return a non-matching
@@ -602,7 +602,10 @@ if (CYTHON_EXECUTABLE)
 endif()
 
 # Binaries
-add_subdirectory(ibacm) # NO SPARSE
+if (NOT NL_KIND EQUAL 0)
+  add_subdirectory(ibacm) # NO SPARSE
+endif()
+
 if (NOT NL_KIND EQUAL 0)
   add_subdirectory(iwpmd)
 endif()

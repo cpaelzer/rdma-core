@@ -297,6 +297,9 @@ class travis(APTEnvironment):
             (cd /usr/local/bin/ && ln -sf ../clang*/bin/clang-7 .)""".format(llvm_tar)];
         return cmds;
 
+    def get_cython(self):
+        return ["""RUN pip3 install cython"""]
+
     def get_docker_file(self):
         # First this to get apt-add-repository
         self.pkgs = {"software-properties-common"}
@@ -315,6 +318,7 @@ class travis(APTEnvironment):
         res.lines.extend(self.get_before_script())
 
         res.lines.extend(self.get_clang())
+        res.lines.extend(self.get_cython())
 
         return res;
 
@@ -640,10 +644,6 @@ def run_deb_build(args,env):
             "-e","TMPDIR=%s"%(os.path.join(home,"tmp")),
             "-e","DEB_BUILD_OPTIONS=parallel=%u"%(multiprocessing.cpu_count()),
         ];
-
-        if not env.build_pyverbs:
-            opts.append("-e");
-            opts.append("EXTRA_CMAKE_FLAGS=%s"%(' '.join(["-DNO_PYVERBS=1"])));
 
         # Create a go.py that will let us run the compilation as the user and
         # then switch to root only for the packaging step.
