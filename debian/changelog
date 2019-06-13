@@ -9,6 +9,7 @@ rdma-core (24.0-1) unstable; urgency=medium
     upstream
   * d/control: fix provides of libefa1
   * d/ibverbs-providers.lintian-overrides: fix libefa-1 to libefa1
+  * d/rules: drop --with systemd for compat level 11 no longer providing that
 
  -- Benjamin Drung <benjamin.drung@cloud.ionos.com>  Tue, 22 Jan 2019 13:27:29 +0100
 
