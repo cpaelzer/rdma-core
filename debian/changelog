@@ -7,6 +7,8 @@ rdma-core (24.0-1) unstable; urgency=medium
   * Bump Standards-Version to 4.3.0 (no changes required)
   * Drop d/p/pyverbs-Add-shebang-to-ib_devices.py-example.patch now being
     upstream
+  * d/control: fix provides of libefa1
+  * d/ibverbs-providers.lintian-overrides: fix libefa-1 to libefa1
 
  -- Benjamin Drung <benjamin.drung@cloud.ionos.com>  Tue, 22 Jan 2019 13:27:29 +0100
 
