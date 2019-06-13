@@ -11,6 +11,9 @@ cdef class Context(PyverbsCM):
     cdef add_ref(self, obj)
     cdef object pds
     cdef object dms
+    cdef object ccs
+    cdef object cqs
+    cdef object qps
 
 cdef class DeviceAttr(PyverbsObject):
     cdef v.ibv_device_attr dev_attr

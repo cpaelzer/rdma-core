@@ -9,6 +9,7 @@ which returns a DeviceAttr object.
 import weakref
 
 from .pyverbs_error import PyverbsRDMAError, PyverbsError
+from pyverbs.cq cimport CQEX, CQ, CompChannel
 from .pyverbs_error import PyverbsUserError
 from pyverbs.base import PyverbsRDMAErrno
 cimport pyverbs.libibverbs_enums as e
@@ -16,6 +17,7 @@ cimport pyverbs.libibverbs as v
 from pyverbs.addr cimport GID
 from pyverbs.mr import DMMR
 from pyverbs.pd cimport PD
+from pyverbs.qp cimport QP
 
 cdef extern from 'errno.h':
     int errno
@@ -25,7 +27,7 @@ cdef extern from 'stdlib.h':
     void free(void *ptr)
 cdef extern from 'string.h':
     void *memset(void *s, int c, size_t n)
-cdef extern from 'malloc.h':
+cdef extern from 'stdlib.h':
     void *malloc(size_t size)
 cdef extern from 'stdint.h':
     ctypedef int uint64_t
@@ -85,6 +87,9 @@ cdef class Context(PyverbsCM):
 
         self.pds = weakref.WeakSet()
         self.dms = weakref.WeakSet()
+        self.ccs = weakref.WeakSet()
+        self.cqs = weakref.WeakSet()
+        self.qps = weakref.WeakSet()
 
         dev_name = kwargs.get('name')
 
@@ -121,13 +126,17 @@ cdef class Context(PyverbsCM):
 
     cpdef close(self):
         self.logger.debug('Closing Context')
-        self.close_weakrefs([self.dms, self.pds])
+        self.close_weakrefs([self.qps, self.ccs, self.cqs, self.dms, self.pds])
         if self.context != NULL:
             rc = v.ibv_close_device(self.context)
             if rc != 0:
                 raise PyverbsRDMAErrno('Failed to close device {dev}'.
                                        format(dev=self.device.name), errno)
             self.context = NULL
+
+    @property
+    def num_comp_vectors(self):
+        return self.context.num_comp_vectors
 
     def query_device(self):
         """
@@ -183,6 +192,12 @@ cdef class Context(PyverbsCM):
             self.pds.add(obj)
         elif isinstance(obj, DM):
             self.dms.add(obj)
+        elif isinstance(obj, CompChannel):
+            self.ccs.add(obj)
+        elif isinstance(obj, CQ) or isinstance(obj, CQEX):
+            self.cqs.add(obj)
+        elif isinstance(obj, QP):
+            self.qps.add(obj)
         else:
             raise PyverbsError('Unrecognized object type')
 
@@ -323,7 +338,8 @@ cdef class DeviceAttr(PyverbsObject):
             print_format.format('HW version', self.hw_ver) +\
             print_format.format('Max QP', self.max_qp) +\
             print_format.format('Max QP WR', self.max_qp_wr) +\
-            print_format.format('Device cap flags', self.device_cap_flags) +\
+            print_format.format('Device cap flags',
+                                translate_device_caps(self.device_cap_flags)) +\
             print_format.format('Max SGE', self.max_sge) +\
             print_format.format('Max SGE RD', self.max_sge_rd) +\
             print_format.format('MAX CQ', self.max_cq) +\
@@ -691,6 +707,7 @@ cdef class PortAttr(PyverbsObject):
             print_format.format('Phys state', phys_state_to_str(self.attr.phys_state)) +\
             print_format.format('Flags', self.attr.flags)
 
+
 def guid_format(num):
     """
     Get GUID representation of the given number, including change of endianness.
@@ -703,38 +720,51 @@ def guid_format(num):
     hex_array = [''.join(x) for x in zip(hex_array[0::2], hex_array[1::2])]
     return ':'.join(hex_array)
 
+
 def translate_transport_type(transport_type):
-    return {-1:'UNKNOWN', 0:'IB', 1:'IWARP', 2:'USNIC',
-            3:'USNIC_UDP'}[transport_type]
+    l = {0: 'IB', 1: 'IWARP', 2: 'USNIC', 3: 'USNIC UDP'}
+    try:
+        return l[transport_type]
+    except KeyError:
+        return 'Unknown'
+
 
 def translate_node_type(node_type):
-    return {-1:'UNKNOWN', 1:'CA', 2:'SWITCH', 3:'ROUTER',
-            4:'RNIC', 5:'USNIC', 6:'USNIC_UDP'}[node_type]
+    l = {1: 'CA', 2: 'Switch', 3: 'Router', 4: 'RNIC', 5: 'USNIC',
+         6: 'USNIC UDP'}
+    try:
+        return l[node_type]
+    except KeyError:
+        return 'Unknown'
+
 
 def guid_to_hex(node_guid):
     return hex(node_guid).replace('L', '').replace('0x', '')
 
+
 def port_state_to_str(port_state):
-    l = {0: 'NOP', 1: 'Down', 2: 'Init', 3: 'Armed',4: 'Active',
-         5: 'Active defer'}
+    l = {0: 'NOP', 1: 'Down', 2: 'Init', 3: 'Armed', 4: 'Active', 5: 'Defer'}
     try:
-        return '{s} ({n})'.format(s=l[port_state], n=port_state)
-    except:
-        return 'Invalid state'
+        return '{s} ({n})'.format(s=l[port_state].name, n=port_state)
+    except KeyError:
+        return 'Invalid state ({s})'.format(s=port_state)
+
 
 def translate_mtu(mtu):
     l = {1: 256, 2: 512, 3: 1024, 4: 2048, 5: 4096}
     try:
         return '{s} ({n})'.format(s=l[mtu], n=mtu)
-    except:
-        return 'Invalid MTU'
+    except KeyError:
+        return 'Invalid MTU ({m})'.format(m=mtu)
+
 
 def translate_link_layer(ll):
     l = {0: 'Unspecified', 1:'InfiniBand', 2:'Ethernet'}
     try:
         return l[ll]
-    except:
-        return 'Invalid link layer {ll}'.format(ll=ll)
+    except KeyError:
+        return 'Invalid link layer ({ll})'.format(ll=ll)
+
 
 def translate_port_cap_flags(flags):
     l = {e.IBV_PORT_SM: 'IBV_PORT_SM',
@@ -763,6 +793,7 @@ def translate_port_cap_flags(flags):
          e.IBV_PORT_IP_BASED_GIDS: 'IBV_PORT_IP_BASED_GIDS'}
     return str_from_flags(flags, l)
 
+
 def translate_port_cap_flags2(flags):
     l = {e.IBV_PORT_SET_NODE_DESC_SUP: 'IBV_PORT_SET_NODE_DESC_SUP',
          e.IBV_PORT_INFO_EXT_SUP: 'IBV_PORT_INFO_EXT_SUP',
@@ -772,13 +803,43 @@ def translate_port_cap_flags2(flags):
          e.IBV_PORT_LINK_SPEED_HDR_SUP: 'IBV_PORT_LINK_SPEED_HDR_SUP'}
     return str_from_flags(flags, l)
 
+
+def translate_device_caps(flags):
+    l = {e.IBV_DEVICE_RESIZE_MAX_WR: 'IBV_DEVICE_RESIZE_MAX_WR',
+         e.IBV_DEVICE_BAD_PKEY_CNTR: 'IBV_DEVICE_BAD_PKEY_CNTR',
+         e.IBV_DEVICE_BAD_QKEY_CNTR: 'IBV_DEVICE_BAD_QKEY_CNTR',
+         e.IBV_DEVICE_RAW_MULTI: 'IBV_DEVICE_RAW_MULTI',
+         e.IBV_DEVICE_AUTO_PATH_MIG: 'IBV_DEVICE_AUTO_PATH_MIG',
+         e.IBV_DEVICE_CHANGE_PHY_PORT: 'IBV_DEVICE_CHANGE_PHY_PORT',
+         e.IBV_DEVICE_UD_AV_PORT_ENFORCE: 'IBV_DEVICE_UD_AV_PORT_ENFORCE',
+         e.IBV_DEVICE_CURR_QP_STATE_MOD: 'IBV_DEVICE_CURR_QP_STATE_MOD',
+         e.IBV_DEVICE_SHUTDOWN_PORT: 'IBV_DEVICE_SHUTDOWN_PORT',
+         e.IBV_DEVICE_INIT_TYPE: 'IBV_DEVICE_INIT_TYPE',
+         e.IBV_DEVICE_PORT_ACTIVE_EVENT: 'IBV_DEVICE_PORT_ACTIVE_EVENT',
+         e.IBV_DEVICE_SYS_IMAGE_GUID: 'IBV_DEVICE_SYS_IMAGE_GUID',
+         e.IBV_DEVICE_RC_RNR_NAK_GEN: 'IBV_DEVICE_RC_RNR_NAK_GEN',
+         e.IBV_DEVICE_SRQ_RESIZE: 'IBV_DEVICE_SRQ_RESIZE',
+         e.IBV_DEVICE_N_NOTIFY_CQ: 'IBV_DEVICE_N_NOTIFY_CQ',
+         e.IBV_DEVICE_MEM_WINDOW: 'IBV_DEVICE_MEM_WINDOW',
+         e.IBV_DEVICE_UD_IP_CSUM: 'IBV_DEVICE_UD_IP_CSUM',
+         e.IBV_DEVICE_XRC: 'IBV_DEVICE_XRC',
+         e.IBV_DEVICE_MEM_MGT_EXTENSIONS: 'IBV_DEVICE_MEM_MGT_EXTENSIONS',
+         e.IBV_DEVICE_MEM_WINDOW_TYPE_2A: 'IBV_DEVICE_MEM_WINDOW_TYPE_2A',
+         e.IBV_DEVICE_MEM_WINDOW_TYPE_2B: 'IBV_DEVICE_MEM_WINDOW_TYPE_2B',
+         e.IBV_DEVICE_RC_IP_CSUM: 'IBV_DEVICE_RC_IP_CSUM',
+         e.IBV_DEVICE_RAW_IP_CSUM: 'IBV_DEVICE_RAW_IP_CSUM',
+         e.IBV_DEVICE_MANAGED_FLOW_STEERING: 'IBV_DEVICE_MANAGED_FLOW_STEERING'}
+    return str_from_flags(flags, l)
+
+
 def str_from_flags(flags, dictionary):
-    str_flags = ""
+    str_flags = "\n  "
     for bit in dictionary:
         if flags & bit:
             str_flags += dictionary[bit]
-            str_flags += ' '
+            str_flags += '\n  '
     return str_flags
+
 
 def phys_state_to_str(phys):
     l =  {1: 'Sleep', 2: 'Polling', 3: 'Disabled',
@@ -786,23 +847,26 @@ def phys_state_to_str(phys):
           6: 'Link error recovery', 7: 'Phy test'}
     try:
         return '{s} ({n})'.format(s=l[phys], n=phys)
-    except:
+    except KeyError:
         return 'Invalid physical state'
+
 
 def width_to_str(width):
     l = {1: '1X', 2: '4X', 4: '8X', 16: '2X'}
     try:
         return '{s} ({n})'.format(s=l[width], n=width)
-    except:
+    except KeyError:
         return 'Invalid width'
+
 
 def speed_to_str(speed):
     l = {1: '2.5 Gbps', 2: '5.0 Gbps', 4: '5.0 Gbps', 8: '10.0 Gbps',
          16: '14.0 Gbps', 32: '25.0 Gbps', 64: '50.0 Gbps'}
     try:
         return '{s} ({n})'.format(s=l[speed], n=speed)
-    except:
+    except KeyError:
         return 'Invalid speed'
+
 
 def get_device_list():
     """

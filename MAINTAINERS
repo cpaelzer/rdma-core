@@ -61,6 +61,11 @@ M:	Steve Wise <swise@opengridcomputing.com>
 S:	Supported
 F:	providers/cxgb4/
 
+EFA USERSPACE PROVIDER (for efa.ko)
+M:	Gal Pressman <galpress@amazon.com>
+S:	Supported
+F:	providers/efa/
+
 HF1 USERSPACE PROVIDER (for hf1.ko)
 M:	Mike Marciniszyn <mike.marciniszyn@intel.com>
 M:	Dennis Dalessandro <dennis.dalessandro@intel.com>
@@ -100,7 +105,8 @@ S:	Supported
 F:	iwpmd/
 
 LIBIBUMAD USERSPACE LIBRARY FOR SMP AND GMP MAD PROCESSING (/dev/infiniband/umadX)
-M:	Hal Rosenstock <hal@dev.mellanox.co.il>
+M:	Daniel Klein <danielk@mellanox.com>
+H:	Hal Rosenstock <hal@dev.mellanox.co.il>
 H:	Sasha Khapyorsky <sashak@voltaire.com>
 H:	Shahar Frank <shahar@voltaire.com>
 S:	Supported
